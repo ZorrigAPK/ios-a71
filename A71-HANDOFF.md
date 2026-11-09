@@ -209,6 +209,18 @@ a5e46fb macos-15-intel runner · 49481a8 MAC addresses in /chosen · 0ea2972 tou
    and verified, phone rebooted into iOS. TODO: ask the user if touch reacts (1 min after the lock screen,
    swipe up from the bottom bar), then go to TWRP and read the log (section 3.4) -> `SWEET TOUCH A71` and
    `dvdd ...` lines; save it as `ios-a71-tools\logs\boot7.txt`.
+   RESULT boot 7 (log `logs\boot7.txt`): no touch. Last touch line was
+   `dvdd apid=228 owner=0 read=1 subtype=0x11 mode=0 vin=0 src=0 out=0x1 en=0x80 status=0x80`, then nothing
+   (no "write=" line): the thread stopped inside the first SPMI write. Cause: arbiter v5 owner (write)
+   channel is at `chnls + 0x10000 * apid` (Linux pmic_arb_offset_v5), not `0x80 * apid` (observer only).
+   Fixed in commit a4673e0 (CI run 42685604760, kernel in `ios-a71-tools\xnu-build-touch4`).
+   Patch regeneration script now saved: `ios-a71-tools\scripts\regen-0082.sh` (run from PowerShell:
+   `wsl -u root -- bash /mnt/c/Users/Techr/ios-a71-tools/scripts/regen-0082.sh`; Git Bash mangles /mnt paths).
+   Git has no global identity: commit with `-c user.name=ZorrigAPK -c user.email=<same as previous commits>`.
+1b. DONE 2026-11-09 ~21:05: boot.img 8 = `ios-a71-tools\a71-build\ios-a71-boot-8.img`, sha256
+   dfdeed00496eef3b5fc799480b6a9c86d4bd98ef25b1213690760827990368b2, flashed + verified, rebooted into iOS.
+   TODO: ask the user if touch reacts, then TWRP -> log -> `logs\boot8.txt`; look for
+   `dvdd write channel pa=... status=...` and `dvdd write=1 -> ... SDA=1 SCL=1`, then the `sec 0x48 id` line.
 2. Fix axes/scale if needed; then consider IRQ-driven polling to save CPU.
 3. Speed: compare `cpus=8` vs `cpus=6`, check the sampler for SpringBoard/backboardd CPU use.
 4. USB device mode (A71 ABL leaves USB30 off: GDSC + clocks must be enabled before patch 0072-0077 logic).
