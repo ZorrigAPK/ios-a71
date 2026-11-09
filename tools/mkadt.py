@@ -115,6 +115,16 @@ def build(seed=None, qemu=False, highmem=False):
         # of the A11 that the iPhone X userland expects.
         ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
         ('chip-id', u32(0x8015)),
+        # iBoot normally publishes the radios' MAC addresses here. Without
+        # them libMobileGestalt's WifiAddress/BluetoothAddress/EthernetMac
+        # answers fall back to IOServiceMatching("IONetworkController") plus a
+        # run-loop wait for a controller that never appears (no Wi-Fi driver):
+        # lsd blocks in _GenerateBuiltInAppInstallSessionID while seeding its
+        # database and SpringBoard never draws (A71 boot 3 samples). Synthetic,
+        # locally administered addresses.
+        ('mac-address-wifi0', bytes([0x02, 0x00, 0x5e, 0x71, 0xa7, 0x01])),
+        ('mac-address-bluetooth0', bytes([0x02, 0x00, 0x5e, 0x71, 0xa7, 0x02])),
+        ('mac-address-ethernet0', bytes([0x02, 0x00, 0x5e, 0x71, 0xa7, 0x03])),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
         # DeviceType then takes its native "Hactivation" branch (state
