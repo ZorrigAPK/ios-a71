@@ -221,6 +221,18 @@ a5e46fb macos-15-intel runner · 49481a8 MAC addresses in /chosen · 0ea2972 tou
    dfdeed00496eef3b5fc799480b6a9c86d4bd98ef25b1213690760827990368b2, flashed + verified, rebooted into iOS.
    TODO: ask the user if touch reacts, then TWRP -> log -> `logs\boot8.txt`; look for
    `dvdd write channel pa=... status=...` and `dvdd write=1 -> ... SDA=1 SCL=1`, then the `sec 0x48 id` line.
+   RESULT boot 8 (log `logs\boot8.txt`): dvdd write=1, SDA=SCL=1, IC ANSWERS:
+   `sec 0x48 id err=0 ac 37 71 boot err=0 0x20 panel err=0 1000 1000`, sense on err=0, loop running.
+   But no touch in iOS: 342 `event read err=5` lines in bursts (each printed line follows a successful
+   read, so reads alternate OK/EIO). EIO = command byte NAK or left-count > 31; not distinguishable there.
+1c. DONE 2026-11-09 ~21:30: commit 54fd7da (CI run 42690557034, kernel `xnu-build-touch5`) adds raw event
+   dumps (`ev xx xx ...`), failing stage (`stage=` 1 START busy, 2 addr NAK, 3 data NAK, 4 rSTART busy,
+   5 read-addr NAK) and `report mask=` lines; keeps the first event when left > 31.
+   boot.img 9 = `a71-build\ios-a71-boot-9.img`, sha256
+   5e7b201d2e0517c233c8dc69c1b8a3d8ea85ce8893e2ae2770f01d43088d9fba, flashed + verified, rebooted into iOS.
+   TODO: user touches the screen, then TWRP -> `logs\boot9.txt` -> read `ev`/`stage`/`report` lines.
+   Note: 8/8 CPUs do come up (`SWEET CPU: 8/8 CPUs initialized`); the ~2 fps is CPU rendering (and maybe
+   low CPU frequency left by ABL: not checked yet).
 2. Fix axes/scale if needed; then consider IRQ-driven polling to save CPU.
 3. Speed: compare `cpus=8` vs `cpus=6`, check the sampler for SpringBoard/backboardd CPU use.
 4. USB device mode (A71 ABL leaves USB30 off: GDSC + clocks must be enabled before patch 0072-0077 logic).
