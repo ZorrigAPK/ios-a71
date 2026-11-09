@@ -1,0 +1,24 @@
+name: shim-a71
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'shim/**'
+      - '.github/workflows/shim-a71.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install aarch64 toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu gawk
+      - name: Build shim Image
+        run: bash shim/build-a71.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shim-a71
+          path: |
+            shim/out/Image
+            shim/out/shim.elf
