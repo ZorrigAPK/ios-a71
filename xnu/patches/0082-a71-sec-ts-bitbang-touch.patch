@@ -8,10 +8,10 @@ boot-arg sweettouchbb=1.
 
 ---
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 03defe6..042b3d9 100644
+index 03defe6..455682d 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -545,6 +545,449 @@ touch_se_init(void)
+@@ -545,6 +545,461 @@ touch_se_init(void)
  	return true;
  }
  
@@ -295,8 +295,8 @@ index 03defe6..042b3d9 100644
 +/*
 + * dvdd: PM6150 (SID 0) GPIO4, peripheral 0xC300, PPID 0x0c3 ("sec,dvdd_gpio").
 + * SPMI PMIC arbiter v5: APID map in core+0x900, owner in cnfg+0x700, reads
-+ * through the observer channel, writes through the owner channel (chnls),
-+ * both at 0x80 * apid for EE 0. Writes only if the APID is owned by EE 0.
++ * through the observer channel (0x80 * apid for EE 0), writes through the
++ * owner channel (chnls + 0x10000 * apid). Writes only if the APID is owned by EE 0.
 + */
 +#define SPMI_CORE_PA    0x0c440000u
 +#define SPMI_CNFG_PA    0x0c40a000u
@@ -310,7 +310,12 @@ index 03defe6..042b3d9 100644
 +static bool
 +spmi_cmd(vm_offset_t base, uint16_t apid, uint32_t opc, uint16_t addr, uint8_t *data)
 +{
-+	uint32_t off = 0x80u * apid;
++	/*
++	 * Arbiter v5 (Linux pmic_arb_offset_v5): the observer (read) channel of
++	 * EE 0 is at 0x80 * apid, but the owner (write) channel is at
++	 * 0x10000 * apid. The write window is mapped per APID, so its offset is 0.
++	 */
++	uint32_t off = (opc == 0u) ? 0u : 0x80u * apid;
 +	if (opc == 0u) {
 +		touch_wr(base, off + 0x10u, *data); /* WDATA0 */
 +	}
@@ -348,9 +353,8 @@ index 03defe6..042b3d9 100644
 +{
 +	spmi_core = ml_io_map(SPMI_CORE_PA, 0x2000);
 +	spmi_cnfg = ml_io_map(SPMI_CNFG_PA, 0x1000);
-+	spmi_chnls = ml_io_map(SPMI_CHNLS_PA, 0x10000);
 +	spmi_obs = ml_io_map(SPMI_OBS_PA, 0x10000);
-+	if (!spmi_core || !spmi_cnfg || !spmi_chnls || !spmi_obs) {
++	if (!spmi_core || !spmi_cnfg || !spmi_obs) {
 +		printf("SWEET TOUCH A71: SPMI mapping failed\n");
 +		return;
 +	}
@@ -382,6 +386,14 @@ index 03defe6..042b3d9 100644
 +		printf("SWEET TOUCH A71: dvdd not a writable apps-owned LV/MV GPIO; PMIC unchanged\n");
 +		return;
 +	}
++	/* Owner channel of this APID only: chnls + 0x10000 * apid. */
++	spmi_chnls = ml_io_map(SPMI_CHNLS_PA + 0x10000u * (uint32_t)apid, 0x1000);
++	if (!spmi_chnls) {
++		printf("SWEET TOUCH A71: SPMI write channel mapping failed\n");
++		return;
++	}
++	printf("SWEET TOUCH A71: dvdd write channel pa=%#x status=%#x\n",
++	    SPMI_CHNLS_PA + 0x10000u * (uint32_t)apid, touch_rd(spmi_chnls, 0x08u));
 +	bool w = spmi_wr8(apid, DVDD_BASE + 0x40u, 0x01u) &&  /* MODE_CTL: digital output */
 +	    spmi_wr8(apid, DVDD_BASE + 0x44u, 0x80u) &&         /* OUT_SRC: constant high */
 +	    spmi_wr8(apid, DVDD_BASE + 0x45u, 0x01u) &&         /* OUT_CTL: CMOS, low drive */
@@ -461,7 +473,7 @@ index 03defe6..042b3d9 100644
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -566,6 +1009,17 @@ touch_thread(void *arg, wait_result_t result)
+@@ -566,6 +1021,17 @@ touch_thread(void *arg, wait_result_t result)
  		printf("SWEET TOUCH: MMIO mapping failed\n");
  		goto out;
  	}
