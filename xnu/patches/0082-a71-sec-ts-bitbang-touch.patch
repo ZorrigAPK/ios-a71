@@ -1,0 +1,352 @@
+From: ZorrigAPK <ZorrigAPK@users.noreply.github.com>
+Subject: [PATCH] a71: bit-banged I2C driver for the Samsung S6SY761/Y771 touch IC
+
+Galaxy A71: SE7 has its FIFO interface disabled (GSI only), so drive
+GPIO6/7 as an open-drain I2C master and read sec_ts events (0x60/0x61).
+Selected automatically when GENI_IF_DISABLE_RO bit 0 is set, or with
+boot-arg sweettouchbb=1.
+
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 03defe6..1ec08a2 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -545,6 +545,320 @@ touch_se_init(void)
+ 	return true;
+ }
+ 
++/*
++ * Galaxy A71 (SM-A715F): the touch IC is a Samsung LSI S6SY761-family part
++ * ("sec,sec_ts", firmware y771_a71) at 0x48 on the same SE7 pins as sweet
++ * (SDA GPIO6, SCL GPIO7, IRQ GPIO9 active low). Samsung's QUP firmware leaves
++ * SE7 with its FIFO interface disabled (GENI_IF_DISABLE_RO bit 0: GSI/DMA
++ * only), so this path drives the two pins as an open-drain bit-banged I2C
++ * master instead. Rails: tsp_ldo (TLMM GPIO56) and dvdd (PM6150 GPIO4) are
++ * regulator-boot-on in the A71 DT; nothing here writes the PMIC or GPIO56.
++ */
++#define BB_SDA          6u
++#define BB_SCL          7u
++#define BB_IRQ          9u
++#define BB_HALF_US      5u
++#define SEC_ADDR        0x48u
++#define SEC_SENSE_ON    0x10u
++#define SEC_PANEL_INFO  0x23u
++#define SEC_DEVICE_ID   0x52u
++#define SEC_BOOT_STATUS 0x55u
++#define SEC_ONE_EVENT   0x60u
++#define SEC_ALL_EVENT   0x61u
++#define SEC_CLEAR_STACK 0x62u
++#define SEC_APP_MODE    0x20u
++#define SEC_EVENT_LEN   8u
++#define SEC_EVENT_MAX   32u
++
++static unsigned bb_max_x = 4096, bb_max_y = 4096;
++
++/* Open drain: "release" = input with pull-up, "low" = output driving 0. */
++static void
++bb_line(unsigned pin, bool high)
++{
++	uint32_t off = TOUCH_GPIO_CFG(pin);
++	uint32_t cfg = touch_rd(st.gpio, off) & ~0x3ffu;
++	cfg |= 3u /* pull-up */ | (1u << 6) /* 4 mA */;
++	if (!high) {
++		touch_wr(st.gpio, TOUCH_GPIO_IO(pin), touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u);
++		cfg |= 0x200u;
++	}
++	touch_wr(st.gpio, off, cfg);
++}
++
++static bool
++bb_get(unsigned pin)
++{
++	return touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & 1u;
++}
++
++static bool
++bb_scl_high(void)
++{
++	bb_line(BB_SCL, true);
++	for (unsigned i = 0; i < 2000; ++i) { /* clock stretching, up to ~2 ms */
++		if (bb_get(BB_SCL)) {
++			delay(BB_HALF_US);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++bb_scl_low(void)
++{
++	bb_line(BB_SCL, false);
++	delay(BB_HALF_US);
++}
++
++static bool
++bb_start(void)
++{
++	bb_line(BB_SDA, true);
++	if (!bb_scl_high()) {
++		return false;
++	}
++	if (!bb_get(BB_SDA)) {
++		return false; /* bus held low by a device */
++	}
++	bb_line(BB_SDA, false);
++	delay(BB_HALF_US);
++	bb_scl_low();
++	return true;
++}
++
++static void
++bb_stop(void)
++{
++	bb_line(BB_SDA, false);
++	delay(BB_HALF_US);
++	(void)bb_scl_high();
++	bb_line(BB_SDA, true);
++	delay(BB_HALF_US);
++}
++
++/* Returns true if the byte was ACKed. */
++static bool
++bb_write(uint8_t v)
++{
++	for (int b = 7; b >= 0; --b) {
++		bb_line(BB_SDA, (v >> b) & 1u);
++		delay(1);
++		if (!bb_scl_high()) {
++			return false;
++		}
++		bb_scl_low();
++	}
++	bb_line(BB_SDA, true);
++	delay(1);
++	if (!bb_scl_high()) {
++		return false;
++	}
++	bool ack = !bb_get(BB_SDA);
++	bb_scl_low();
++	return ack;
++}
++
++static uint8_t
++bb_read(bool ack)
++{
++	uint8_t v = 0;
++	bb_line(BB_SDA, true);
++	for (int b = 7; b >= 0; --b) {
++		(void)bb_scl_high();
++		v |= (uint8_t)((bb_get(BB_SDA) ? 1u : 0u) << b);
++		bb_scl_low();
++	}
++	bb_line(BB_SDA, !ack);
++	delay(1);
++	(void)bb_scl_high();
++	bb_scl_low();
++	bb_line(BB_SDA, true);
++	return v;
++}
++
++/* Write ntx bytes, then (if nrx) repeated START and read nrx bytes. */
++static int
++bb_xfer(uint8_t addr, const uint8_t *tx, unsigned ntx, uint8_t *rx, unsigned nrx)
++{
++	int err = 0;
++	if (!bb_start()) {
++		bb_stop();
++		return EBUSY;
++	}
++	if (ntx) {
++		if (!bb_write((uint8_t)(addr << 1))) {
++			err = ENXIO;
++			goto stop;
++		}
++		for (unsigned i = 0; i < ntx; ++i) {
++			if (!bb_write(tx[i])) {
++				err = EIO;
++				goto stop;
++			}
++		}
++	}
++	if (nrx) {
++		if (ntx && !bb_start()) {
++			err = EBUSY;
++			goto stop;
++		}
++		if (!bb_write((uint8_t)((addr << 1) | 1u))) {
++			err = ENXIO;
++			goto stop;
++		}
++		for (unsigned i = 0; i < nrx; ++i) {
++			rx[i] = bb_read(i + 1 < nrx);
++		}
++	}
++stop:
++	bb_stop();
++	return err;
++}
++
++static int
++sec_cmd(uint8_t cmd)
++{
++	return bb_xfer(SEC_ADDR, &cmd, 1, NULL, 0);
++}
++
++static int
++sec_read(uint8_t cmd, uint8_t *buf, unsigned len)
++{
++	return bb_xfer(SEC_ADDR, &cmd, 1, buf, len);
++}
++
++static int
++touch_a71_probe(void)
++{
++	uint8_t id[3] = {0}, boot = 0, panel[4] = {0};
++	int e1 = sec_read(SEC_DEVICE_ID, id, sizeof(id));
++	int e2 = sec_read(SEC_BOOT_STATUS, &boot, 1);
++	int e3 = sec_read(SEC_PANEL_INFO, panel, sizeof(panel));
++	printf("SWEET TOUCH A71: sec 0x48 id err=%d %02x %02x %02x boot err=%d %#x panel err=%d %02x%02x %02x%02x\n",
++	    e1, id[0], id[1], id[2], e2, boot, e3, panel[0], panel[1], panel[2], panel[3]);
++	uint8_t dummy = 0;
++	int e50 = bb_xfer(0x50, NULL, 0, &dummy, 1);
++	printf("SWEET TOUCH A71: address 0x50 (imagis) err=%d\n", e50);
++	if (e1) {
++		return e1;
++	}
++	unsigned mx = ((unsigned)panel[0] << 8) | panel[1];
++	unsigned my = ((unsigned)panel[2] << 8) | panel[3];
++	if (!e3 && mx >= 500 && mx <= 8192 && my >= 500 && my <= 8192) {
++		bb_max_x = mx;
++		bb_max_y = my;
++	}
++	if (!e2 && boot != SEC_APP_MODE) {
++		printf("SWEET TOUCH A71: IC not in application mode (%#x); no firmware upload here\n", boot);
++		return ENOTSUP;
++	}
++	(void)sec_cmd(SEC_CLEAR_STACK);
++	touch_wait(5);
++	int e4 = sec_cmd(SEC_SENSE_ON);
++	printf("SWEET TOUCH A71: sense on err=%d, range %ux%u -> 1080x2400\n", e4, bb_max_x, bb_max_y);
++	return e4;
++}
++
++static int
++touch_a71_events(void)
++{
++	uint8_t ev[SEC_EVENT_LEN * SEC_EVENT_MAX];
++	int err = sec_read(SEC_ONE_EVENT, ev, SEC_EVENT_LEN);
++	if (err) {
++		return err;
++	}
++	unsigned n = 1, left = ev[7] & 0x3fu;
++	if (left) {
++		if (left > SEC_EVENT_MAX - 1) {
++			(void)sec_cmd(SEC_CLEAR_STACK);
++			return EIO;
++		}
++		err = sec_read(SEC_ALL_EVENT, ev + SEC_EVENT_LEN, left * SEC_EVENT_LEN);
++		if (err) {
++			return err;
++		}
++		n += left;
++	}
++	int x[TOUCH_MAX], y[TOUCH_MAX];
++	uint32_t mask = st.active;
++	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
++		x[id] = st.x[id];
++		y[id] = st.y[id];
++	}
++	for (unsigned i = 0; i < n; ++i) {
++		const uint8_t *p = ev + i * SEC_EVENT_LEN;
++		if ((p[0] & 3u) != 1u) {
++			continue; /* status / gesture events */
++		}
++		unsigned id = (p[0] >> 2) & 15u, state = p[0] >> 6;
++		if (id >= TOUCH_MAX) {
++			continue;
++		}
++		unsigned rx_ = ((unsigned)p[1] << 4) | (p[3] >> 4);
++		unsigned ry_ = ((unsigned)p[2] << 4) | (p[3] & 15u);
++		int px = (int)(rx_ * 1080u / bb_max_x), py = (int)(ry_ * 2400u / bb_max_y);
++		if (px > 1079) {
++			px = 1079;
++		}
++		if (py > 2399) {
++			py = 2399;
++		}
++		if (state == 3u) {
++			mask &= ~(1u << id);
++		} else if (state == 1u || state == 2u) {
++			mask |= 1u << id;
++			x[id] = px;
++			y[id] = py;
++		}
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++static void
++touch_a71_loop(void)
++{
++	printf("SWEET TOUCH A71: bit-banged I2C on GPIO%u/%u, IRQ GPIO%u=%u, tsp_ldo GPIO56 io=%#x\n",
++	    BB_SDA, BB_SCL, BB_IRQ, bb_get(BB_IRQ), touch_rd(st.gpio, TOUCH_GPIO_IO(56)));
++	touch_gpio(BB_IRQ, 0, 3, 1, false, false); /* IRQ input, pull-up */
++	bb_line(BB_SDA, true);
++	bb_line(BB_SCL, true);
++	touch_wait(5);
++	/* Free a stuck bus: up to 9 clocks until SDA is released. */
++	for (unsigned i = 0; i < 9 && !bb_get(BB_SDA); ++i) {
++		bb_scl_low();
++		(void)bb_scl_high();
++	}
++	bb_stop();
++	int err = touch_a71_probe();
++	if (err) {
++		printf("SWEET TOUCH A71: probe failed %d; stopping\n", err);
++		return;
++	}
++	printf("SWEET TOUCH A71: running, poll=10ms\n");
++	unsigned errors = 0, ticks = 0;
++	while (!st.dead) {
++		if (st.active || !bb_get(BB_IRQ) || (++ticks % 20u) == 0) {
++			err = touch_a71_events();
++			if (err) {
++				if ((errors++ % 100u) == 0) {
++					printf("SWEET TOUCH A71: event read err=%d\n", err);
++				}
++				if (errors == 10) {
++					touch_report(0, st.x, st.y);
++				}
++			} else {
++				errors = 0;
++			}
++		}
++		touch_wait(10);
++	}
++	touch_report(0, st.x, st.y);
++}
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -566,6 +880,17 @@ touch_thread(void *arg, wait_result_t result)
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
++	{
++		int bb = 0;
++		(void)PE_parse_boot_argn("sweettouchbb", &bb, sizeof(bb));
++		uint32_t ifdis = touch_rd(st.se, 0x64);
++		if (bb || (ifdis & 1u)) {
++			printf("SWEET TOUCH: SE7 IF_DISABLE=%#x sweettouchbb=%d -> A71 bit-banged path\n",
++			    ifdis, bb);
++			touch_a71_loop();
++			goto out;
++		}
++	}
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
