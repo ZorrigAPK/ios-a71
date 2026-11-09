@@ -8,10 +8,10 @@ boot-arg sweettouchbb=1.
 
 ---
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 03defe6..ecd7bfb 100644
+index 03defe6..042b3d9 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -545,6 +545,345 @@ touch_se_init(void)
+@@ -545,6 +545,449 @@ touch_se_init(void)
  	return true;
  }
  
@@ -292,9 +292,113 @@ index 03defe6..ecd7bfb 100644
 +#define TOUCH_WEST_PA   0x03500000u
 +#define A71_TSP_LDO     56u
 +
++/*
++ * dvdd: PM6150 (SID 0) GPIO4, peripheral 0xC300, PPID 0x0c3 ("sec,dvdd_gpio").
++ * SPMI PMIC arbiter v5: APID map in core+0x900, owner in cnfg+0x700, reads
++ * through the observer channel, writes through the owner channel (chnls),
++ * both at 0x80 * apid for EE 0. Writes only if the APID is owned by EE 0.
++ */
++#define SPMI_CORE_PA    0x0c440000u
++#define SPMI_CNFG_PA    0x0c40a000u
++#define SPMI_CHNLS_PA   0x0c600000u
++#define SPMI_OBS_PA     0x0e600000u
++#define DVDD_PPID       0x0c3u
++#define DVDD_BASE       0xc300u
++
++static vm_offset_t spmi_core, spmi_cnfg, spmi_chnls, spmi_obs;
++
++static bool
++spmi_cmd(vm_offset_t base, uint16_t apid, uint32_t opc, uint16_t addr, uint8_t *data)
++{
++	uint32_t off = 0x80u * apid;
++	if (opc == 0u) {
++		touch_wr(base, off + 0x10u, *data); /* WDATA0 */
++	}
++	touch_wr(base, off, (opc << 27) | ((uint32_t)(addr & 0xffu) << 4));
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t s = touch_rd(base, off + 0x08u);
++		if (s & 1u) {
++			if (s & 0x0eu) {
++				return false;
++			}
++			if (opc == 1u) {
++				*data = (uint8_t)touch_rd(base, off + 0x18u); /* RDATA0 */
++			}
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++spmi_rd8(uint16_t apid, uint16_t addr, uint8_t *v)
++{
++	return spmi_cmd(spmi_obs, apid, 1u /* EXT_READL */, addr, v);
++}
++
++static bool
++spmi_wr8(uint16_t apid, uint16_t addr, uint8_t v)
++{
++	return spmi_cmd(spmi_chnls, apid, 0u /* EXT_WRITEL */, addr, &v);
++}
++
++static void
++touch_a71_dvdd(void)
++{
++	spmi_core = ml_io_map(SPMI_CORE_PA, 0x2000);
++	spmi_cnfg = ml_io_map(SPMI_CNFG_PA, 0x1000);
++	spmi_chnls = ml_io_map(SPMI_CHNLS_PA, 0x10000);
++	spmi_obs = ml_io_map(SPMI_OBS_PA, 0x10000);
++	if (!spmi_core || !spmi_cnfg || !spmi_chnls || !spmi_obs) {
++		printf("SWEET TOUCH A71: SPMI mapping failed\n");
++		return;
++	}
++	uint32_t count = touch_rd(spmi_core, 4) & 0x7ffu;
++	uint16_t apid = 0xffffu;
++	uint32_t owner = 7;
++	for (uint32_t i = 0; i < count && i < 512; ++i) {
++		uint32_t map = touch_rd(spmi_core, 0x900u + 4u * i);
++		if (map && ((map >> 8) & 0xfffu) == DVDD_PPID) {
++			uint32_t o = touch_rd(spmi_cnfg, 0x700u + 4u * i) & 7u;
++			if (apid == 0xffffu || o == 0) {
++				apid = (uint16_t)i;
++				owner = o;
++			}
++		}
++	}
++	if (apid == 0xffffu) {
++		printf("SWEET TOUCH A71: dvdd PM6150 GPIO4 (ppid 0x0c3) not in the APID map\n");
++		return;
++	}
++	uint8_t sub = 0, mode = 0, vin = 0, src = 0, out = 0, en = 0, val = 0;
++	bool ok = spmi_rd8(apid, DVDD_BASE + 0x05u, &sub) &&
++	    spmi_rd8(apid, DVDD_BASE + 0x40u, &mode) && spmi_rd8(apid, DVDD_BASE + 0x41u, &vin) &&
++	    spmi_rd8(apid, DVDD_BASE + 0x44u, &src) && spmi_rd8(apid, DVDD_BASE + 0x45u, &out) &&
++	    spmi_rd8(apid, DVDD_BASE + 0x46u, &en) && spmi_rd8(apid, DVDD_BASE + 0x08u, &val);
++	printf("SWEET TOUCH A71: dvdd apid=%u owner=%u read=%d subtype=%#x mode=%#x vin=%#x src=%#x out=%#x en=%#x status=%#x\n",
++	    apid, owner, ok, sub, mode, vin, src, out, en, val);
++	if (!ok || owner != 0 || sub < 0x10u || sub > 0x13u) {
++		printf("SWEET TOUCH A71: dvdd not a writable apps-owned LV/MV GPIO; PMIC unchanged\n");
++		return;
++	}
++	bool w = spmi_wr8(apid, DVDD_BASE + 0x40u, 0x01u) &&  /* MODE_CTL: digital output */
++	    spmi_wr8(apid, DVDD_BASE + 0x44u, 0x80u) &&         /* OUT_SRC: constant high */
++	    spmi_wr8(apid, DVDD_BASE + 0x45u, 0x01u) &&         /* OUT_CTL: CMOS, low drive */
++	    spmi_wr8(apid, DVDD_BASE + 0x46u, 0x80u);           /* EN_CTL: enable */
++	touch_wait(50);
++	(void)spmi_rd8(apid, DVDD_BASE + 0x40u, &mode);
++	(void)spmi_rd8(apid, DVDD_BASE + 0x44u, &src);
++	(void)spmi_rd8(apid, DVDD_BASE + 0x46u, &en);
++	(void)spmi_rd8(apid, DVDD_BASE + 0x08u, &val);
++	printf("SWEET TOUCH A71: dvdd write=%d -> mode=%#x src=%#x en=%#x status=%#x; SDA=%u SCL=%u\n",
++	    w, mode, src, en, val, bb_get(BB_SDA), bb_get(BB_SCL));
++}
++
 +static void
 +touch_a71_power(void)
 +{
++	touch_a71_dvdd();
 +	vm_offset_t west = ml_io_map(TOUCH_WEST_PA, 0x39000);
 +	if (!west) {
 +		printf("SWEET TOUCH A71: WEST tile mapping failed\n");
@@ -357,7 +461,7 @@ index 03defe6..ecd7bfb 100644
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -566,6 +905,17 @@ touch_thread(void *arg, wait_result_t result)
+@@ -566,6 +1009,17 @@ touch_thread(void *arg, wait_result_t result)
  		printf("SWEET TOUCH: MMIO mapping failed\n");
  		goto out;
  	}
