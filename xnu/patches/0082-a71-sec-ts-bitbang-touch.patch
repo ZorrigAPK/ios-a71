@@ -8,10 +8,10 @@ boot-arg sweettouchbb=1.
 
 ---
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 03defe6..455682d 100644
+index 03defe6..4454582 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -545,6 +545,461 @@ touch_se_init(void)
+@@ -545,6 +545,489 @@ touch_se_init(void)
  	return true;
  }
  
@@ -41,6 +41,9 @@ index 03defe6..455682d 100644
 +#define SEC_EVENT_MAX   32u
 +
 +static unsigned bb_max_x = 4096, bb_max_y = 4096;
++/* Where the last bb_xfer failed: 1 START busy, 2 address NAK, 3 data NAK
++ * (bb_fail_idx = byte index), 4 repeated START busy, 5 read-address NAK. */
++static unsigned bb_fail, bb_fail_idx, bb_dumps, bb_reports, bb_errlogs;
 +
 +/* Open drain: "release" = input with pull-up, "low" = output driving 0. */
 +static void
@@ -154,17 +157,22 @@ index 03defe6..455682d 100644
 +bb_xfer(uint8_t addr, const uint8_t *tx, unsigned ntx, uint8_t *rx, unsigned nrx)
 +{
 +	int err = 0;
++	bb_fail = 0;
 +	if (!bb_start()) {
++		bb_fail = 1;
 +		bb_stop();
 +		return EBUSY;
 +	}
 +	if (ntx) {
 +		if (!bb_write((uint8_t)(addr << 1))) {
++			bb_fail = 2;
 +			err = ENXIO;
 +			goto stop;
 +		}
 +		for (unsigned i = 0; i < ntx; ++i) {
 +			if (!bb_write(tx[i])) {
++				bb_fail = 3;
++				bb_fail_idx = i;
 +				err = EIO;
 +				goto stop;
 +			}
@@ -172,10 +180,12 @@ index 03defe6..455682d 100644
 +	}
 +	if (nrx) {
 +		if (ntx && !bb_start()) {
++			bb_fail = 4;
 +			err = EBUSY;
 +			goto stop;
 +		}
 +		if (!bb_write((uint8_t)((addr << 1) | 1u))) {
++			bb_fail = 5;
 +			err = ENXIO;
 +			goto stop;
 +		}
@@ -241,14 +251,25 @@ index 03defe6..455682d 100644
 +		return err;
 +	}
 +	unsigned n = 1, left = ev[7] & 0x3fu;
++	bool nonzero = false;
++	for (unsigned i = 0; i < SEC_EVENT_LEN; ++i) {
++		nonzero = nonzero || ev[i];
++	}
++	if (nonzero && bb_dumps < 300) {
++		++bb_dumps;
++		printf("SWEET TOUCH A71: ev %02x %02x %02x %02x %02x %02x %02x %02x irq=%u\n",
++		    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], bb_get(BB_IRQ));
++	}
++	if (left > SEC_EVENT_MAX - 1) {
++		/* Keep the first event; drop the rest of an implausible count. */
++		(void)sec_cmd(SEC_CLEAR_STACK);
++		left = 0;
++	}
 +	if (left) {
-+		if (left > SEC_EVENT_MAX - 1) {
-+			(void)sec_cmd(SEC_CLEAR_STACK);
-+			return EIO;
-+		}
 +		err = sec_read(SEC_ALL_EVENT, ev + SEC_EVENT_LEN, left * SEC_EVENT_LEN);
 +		if (err) {
-+			return err;
++			printf("SWEET TOUCH A71: all-event read of %u failed %d stage=%u\n", left, err, bb_fail);
++			left = 0; /* still use the first event */
 +		}
 +		n += left;
 +	}
@@ -283,6 +304,10 @@ index 03defe6..455682d 100644
 +			x[id] = px;
 +			y[id] = py;
 +		}
++	}
++	if ((mask || st.active) && bb_reports < 60) {
++		++bb_reports;
++		printf("SWEET TOUCH A71: report mask=%#x id0=%d,%d (n=%u)\n", mask, x[0], y[0], n);
 +	}
 +	touch_report(mask, x, y);
 +	return 0;
@@ -455,9 +480,12 @@ index 03defe6..455682d 100644
 +		if (st.active || !bb_get(BB_IRQ) || (++ticks % 20u) == 0) {
 +			err = touch_a71_events();
 +			if (err) {
-+				if ((errors++ % 100u) == 0) {
-+					printf("SWEET TOUCH A71: event read err=%d\n", err);
++				if (bb_errlogs < 200 || (errors % 100u) == 99) {
++					++bb_errlogs;
++					printf("SWEET TOUCH A71: event read err=%d stage=%u idx=%u irq=%u SDA=%u SCL=%u (#%u)\n",
++					    err, bb_fail, bb_fail_idx, bb_get(BB_IRQ), bb_get(BB_SDA), bb_get(BB_SCL), errors);
 +				}
++				++errors;
 +				if (errors == 10) {
 +					touch_report(0, st.x, st.y);
 +				}
@@ -473,7 +501,7 @@ index 03defe6..455682d 100644
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -566,6 +1021,17 @@ touch_thread(void *arg, wait_result_t result)
+@@ -566,6 +1049,17 @@ touch_thread(void *arg, wait_result_t result)
  		printf("SWEET TOUCH: MMIO mapping failed\n");
  		goto out;
  	}
