@@ -233,6 +233,16 @@ a5e46fb macos-15-intel runner · 49481a8 MAC addresses in /chosen · 0ea2972 tou
    TODO: user touches the screen, then TWRP -> `logs\boot9.txt` -> read `ev`/`stage`/`report` lines.
    Note: 8/8 CPUs do come up (`SWEET CPU: 8/8 CPUs initialized`); the ~2 fps is CPU rendering (and maybe
    low CPU frequency left by ABL: not checked yet).
+   RESULT boot 9 (log `logs\boot9.txt`): 268 raw events, 0 read errors, 0 reports. Events are real:
+   press `44 ..`, move `84 ..`, release `c4 .. 00 00 00 00`, status `1d ..`. Root cause: sec_ts uses
+   eid 0 = COORDINATE (1 = status), tid 1-based; byte 7 = left_event:5 + max_energy:1 (bit 5 often set ->
+   6-bit mask gave 33 -> boot 8 EIO). Fixed in commit cc66e80 (CI run 42694644230).
+   Decoded raw range seen in boot 9: x 1965..4038, y 1561..4075 (of 4096) - corners never seen, maybe
+   touched before the thread started (45 s). Axes/scale NOT yet validated.
+   boot.img 10 (kernel `xnu-build-boot10`) sha256 28b9e6bd3d5ac4fa846a5ee338de435b8dfee0bc3b2d8b900bec5d95ed6f9e8b
+   flashed + verified + rebooted 2026-11-09. TODO: user test, then TWRP -> `logs\boot10.txt`, `report mask=` lines.
+   Automation: `ios-a71-tools\scripts\build-flash.ps1 -RunId <id> -N <n>` waits for CI, builds boot N,
+   flashes from TWRP, checks sha256, reboots.
 2. Fix axes/scale if needed; then consider IRQ-driven polling to save CPU.
 3. Speed: compare `cpus=8` vs `cpus=6`, check the sampler for SpringBoard/backboardd CPU use.
 4. USB device mode (A71 ABL leaves USB30 off: GDSC + clocks must be enabled before patch 0072-0077 logic).
