@@ -8,10 +8,10 @@ boot-arg sweettouchbb=1.
 
 ---
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 03defe6..4454582 100644
+index 03defe6..2cf8045 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -545,6 +545,489 @@ touch_se_init(void)
+@@ -545,6 +545,496 @@ touch_se_init(void)
  	return true;
  }
  
@@ -250,12 +250,13 @@ index 03defe6..4454582 100644
 +	if (err) {
 +		return err;
 +	}
-+	unsigned n = 1, left = ev[7] & 0x3fu;
++	/* y771 event: byte 7 = left_event:5, max_energy:1, ttype_1_0:2. */
++	unsigned n = 1, left = ev[7] & 0x1fu;
 +	bool nonzero = false;
 +	for (unsigned i = 0; i < SEC_EVENT_LEN; ++i) {
 +		nonzero = nonzero || ev[i];
 +	}
-+	if (nonzero && bb_dumps < 300) {
++	if (nonzero && bb_dumps < 80) {
 +		++bb_dumps;
 +		printf("SWEET TOUCH A71: ev %02x %02x %02x %02x %02x %02x %02x %02x irq=%u\n",
 +		    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], bb_get(BB_IRQ));
@@ -281,10 +282,16 @@ index 03defe6..4454582 100644
 +	}
 +	for (unsigned i = 0; i < n; ++i) {
 +		const uint8_t *p = ev + i * SEC_EVENT_LEN;
-+		if ((p[0] & 3u) != 1u) {
-+			continue; /* status / gesture events */
++		/*
++		 * sec_ts: eid 0 = coordinate, 1 = status, 2 = gesture, 3 = empty
++		 * (boot 9: presses 0x44, moves 0x84, releases 0xc4, status 0x1d).
++		 * tid is 1-based.
++		 */
++		if ((p[0] & 3u) != 0u) {
++			continue; /* status / gesture / empty events */
 +		}
-+		unsigned id = (p[0] >> 2) & 15u, state = p[0] >> 6;
++		unsigned tid = (p[0] >> 2) & 15u, state = p[0] >> 6;
++		unsigned id = tid ? tid - 1u : 0u;
 +		if (id >= TOUCH_MAX) {
 +			continue;
 +		}
@@ -305,7 +312,7 @@ index 03defe6..4454582 100644
 +			y[id] = py;
 +		}
 +	}
-+	if ((mask || st.active) && bb_reports < 60) {
++	if ((mask || st.active) && bb_reports < 150) {
 +		++bb_reports;
 +		printf("SWEET TOUCH A71: report mask=%#x id0=%d,%d (n=%u)\n", mask, x[0], y[0], n);
 +	}
@@ -501,7 +508,7 @@ index 03defe6..4454582 100644
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -566,6 +1049,17 @@ touch_thread(void *arg, wait_result_t result)
+@@ -566,6 +1056,17 @@ touch_thread(void *arg, wait_result_t result)
  		printf("SWEET TOUCH: MMIO mapping failed\n");
  		goto out;
  	}
