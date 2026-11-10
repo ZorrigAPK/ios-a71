@@ -196,6 +196,14 @@ Axes may need swapping/inverting once events arrive.
 - Do not download unofficial binaries (TWRP builds from random hosts, Odin) on the user's behalf; the user
   downloads them, we verify hashes. Official sources only (Apple CDN, GitHub releases of the authors).
 - Read the GPIO tile before touching a pin; read hardware state and log it before writing anything.
+- iOS Settings > Accessibility > **Bold Text** = black screen after the Apple logo: CoreUI styles symbols
+  through Core Image -> CIContext with an EAGL/GL context -> no GPU -> SpringBoard SIGSEGV pc 0 in
+  CI::GLContext::init. Fixed 2026-11-10 offline: dump the first 16 GB of sda32 to WSL, replay the pending
+  HFS+ journal (`scripts\hfs-replay.py`, then `hfs-jclear.py`), mount rw,force, set
+  `EnhancedTextLegibilityEnabled` false in /private/var/mobile/Library/Preferences/com.apple.Accessibility.plist
+  (`scripts\bold-off.py`), write back only the changed 4 MiB chunks (`chunk-hash.py`, `extract-chunks.sh`,
+  `write-chunks.ps1`, checks before/after hashes). Same recipe works for any iOS setting that breaks boot.
+  Linux mounts an unclean HFS+ read-only even with `force`; never edit without replaying the journal first.
 
 ---------------------------------------------------------------------------------------------------
 ## 8. Commits on the fork (main)
