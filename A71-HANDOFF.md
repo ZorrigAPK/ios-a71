@@ -16,7 +16,8 @@ Talk to them in French, simply; they press buttons and send photos of the screen
 |---|---|
 | iOS 16.7.16 (iPhone X userland) boots to the **lock screen** | WORKS (since boot.img 4) |
 | Volume / power keys (sweet_keys.c, PMIC SPMI reads) | WORK (laggy) |
-| Display | CPU-rendered, ~5 fps, `sweetfb_hz=30`; slow but correct |
+| Display | CPU-rendered, ~5 fps, `sweetfb_hz=30`; slow but correct. Brightness fixed high (no backlight/DCS control yet) |
+| CPU frequency (patch 0085, boot 13) | ABL left gold (2x A76) at **300 MHz**, silver 1497 MHz, L3 1190 MHz. sweet_cpufreq.c now sets OSM perf state (reg 0x920) to max: gold 2208, silver 1804, L3 1459 MHz (no boost rows in the LUTs). Silver bench 93.5 -> 77.6 ms. `sweetcpufreq=0` = log only |
 | Touch (Samsung S6SY761/Y771 "sec_ts") | **WORKS** since boot 10 (user confirmed 2026-11-10); accuracy of axes/scale not yet checked — see section 6 |
 | USB device mode + network | **WORKS** since boot 12 (2026-11-10, patches 0083 power-up + 0084 CDC-NCM, boot-arg `sweetusb=2`). Windows inbox UsbNcm binds it: adapter "Ethernet 2 / Sweet iOS (USB Ethernet)", PC gets 169.254.x.y/16 by itself, phone ue0 = 169.254.7.2 (`ping 169.254.7.2` OK, 1-2 ms). Live kernel log = UDP broadcast to port 5140, ~45 s after link up: `python -I ios-a71-tools\scripts\usb-log.py ios-a71-tools\logs\bootN-usb.txt 900` (no TWRP needed to read logs any more). boot 11 log = full power-up trace. |
 | Wi-Fi, BT, audio, modem, camera, GPU, real date/time | not working (no drivers) — expected |
