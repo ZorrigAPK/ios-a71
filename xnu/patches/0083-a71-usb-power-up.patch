@@ -1,0 +1,243 @@
+From: ZorrigAPK <ZorrigAPK@users.noreply.github.com>
+Subject: [PATCH] a71: power up USB (rails, GDSC, clocks, QUSB2 PHY, DWC3 device mode)
+
+Galaxy A71: ABL leaves the USB30_PRIM GDSC and the controller clocks off
+(sweet's ABL left them on after fastboot). With boot-arg sweetusb=2:
+vote the QUSB2 PHY rails over RPMh (ldoa4 0.88 V, ldoa11 1.8 V,
+ldoa17 3.075 V), turn on the GDSC, set the master clock to 133.33 MHz,
+enable the branch clocks, write the DT qcom,qusb-phy-init-seq, select the
+UTMI clock as pipe clock (no SS PHY), put the DWC3 in device mode, then
+run the existing device-mode code. Every step is logged and the DWC3 is
+only touched once its clocks report on.
+
+---
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d8..bf9666b 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -234,7 +234,7 @@ rh_send(uint32_t address, unsigned mv)
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+ 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++				printf("SWEET RPMH: conflicting inherited request for %#x in TCS%u\n", address, t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -320,16 +320,34 @@ rh_send(uint32_t address, unsigned mv)
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: %#x ACTIVE vote complete (rail voltage requires hardware verification)\n", address);
+ 	return 0;
+ }
+ 
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/*
++	 * Board-specific helper: do not apply PMIC5-LDO policy to arbitrary
++	 * resources. ldoc11 = sweet touch; ldoa4/ldoa11/ldoa17 = the QUSB2 PHY
++	 * rails of the Galaxy A71 (DT qusb@88e2000 vdd/vdda18/vdda33 supplies,
++	 * ranges from the pm6150_l4/l11/l17 regulator nodes).
++	 */
++	static const struct {
++		const char *name;
++		unsigned    min_mv, max_mv;
++	} allowed[] = {
++		{ "ldoc11", 2950, 3400 },
++		{ "ldoa4", 824, 920 },
++		{ "ldoa11", 1696, 1984 },
++		{ "ldoa17", 3000, 3104 },
++	};
++	bool ok = false;
++	for (unsigned i = 0; res && i < sizeof(allowed) / sizeof(allowed[0]); ++i) {
++		ok = ok || (!strcmp(res, allowed[i].name) && mv >= allowed[i].min_mv && mv <= allowed[i].max_mv);
++	}
++	if (!ok) {
++		printf("SWEET RPMH: %s %u mV not in the allowed list\n", res ? res : "(null)", mv);
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b6c1a41..4e7059e 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -73,6 +73,143 @@ usb_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++/*
++ * Galaxy A71: a normal (non-fastboot) ABL boot leaves the USB30_PRIM GDSC
++ * and the controller clocks off, and the QUSB2 PHY unprogrammed. With
++ * sweetusb=2 they are brought up here the way Linux dwc3-msm/qusb-phy-v2
++ * do it, using the A71 DT (qusb@88e2000, ssusb@a600000) and the SM7150 GCC
++ * layout (Linux gcc-sdmmagpie.c): rails, GDSC, master RCG, branch clocks,
++ * PHY init sequence, UTMI-as-pipe clock, DWC3 device mode.
++ */
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++
++#define GCC_USB30_PRIM_BCR      0x0f000
++#define GCC_USB30_MASTER_CMD    0x0f01c         /* usb30_prim_master_clk_src */
++#define GCC_USB30_MASTER_CFG    0x0f020
++#define GCC_USB30_UTMI_CMD      0x0f034         /* usb30_prim_mock_utmi_clk_src */
++#define GCC_USB30_UTMI_CFG      0x0f038
++
++/* DT qcom,qusb-phy-init-seq: <value offset> pairs, written in order. */
++static const uint16_t a71_qusb_init[][2] = {
++	{ 0x23, 0x210 }, { 0x03, 0x004 }, { 0x7c, 0x18c }, { 0x80, 0x02c },
++	{ 0x0a, 0x184 }, { 0x19, 0x0b4 }, { 0x40, 0x194 }, { 0x22, 0x198 },
++	{ 0x21, 0x214 }, { 0x08, 0x220 }, { 0x58, 0x224 }, { 0x45, 0x240 },
++	{ 0x29, 0x244 }, { 0xca, 0x248 }, { 0x04, 0x24c }, { 0x03, 0x250 },
++	{ 0x30, 0x23c }, { 0x22, 0x210 },
++};
++
++static void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Set CLK_ENABLE of a branch clock and wait for CLK_OFF to clear. */
++static bool
++usb_branch_on(vm_offset_t gcc, const char *name, uint32_t off)
++{
++	uint32_t before = usb_rd(gcc, off);
++	usb_wr(gcc, off, before | 1u);
++	uint32_t v = 0;
++	unsigned i;
++	for (i = 0; i < 500; i++) {
++		v = usb_rd(gcc, off);
++		if (!(v & CBCR_CLK_OFF)) {
++			break;
++		}
++		delay(2);
++	}
++	printf("SWEET USB A71: clk %-12s 0x%08x -> 0x%08x (%s after %u us)\n", name, before, v,
++	    (v & CBCR_CLK_OFF) ? "STILL OFF" : "on", i * 2);
++	return !(v & CBCR_CLK_OFF);
++}
++
++static bool
++usb_a71_power_up(vm_offset_t gcc)
++{
++	/* 1. QUSB2 PHY rails: vdd 0.88 V, vdda18 1.8 V, vdda33 3.075 V. */
++	int e4 = sweet_rpmh_vreg_enable("ldoa4", 880);
++	int e11 = sweet_rpmh_vreg_enable("ldoa11", 1800);
++	int e17 = sweet_rpmh_vreg_enable("ldoa17", 3075);
++	printf("SWEET USB A71: PHY rails ldoa4=%d ldoa11=%d ldoa17=%d (0 = voted)\n", e4, e11, e17);
++
++	/* 2. USB30_PRIM GDSC: clear SW_COLLAPSE, wait for PWR_ON. */
++	uint32_t g = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	usb_wr(gcc, GCC_USB30_PRIM_GDSCR, g & ~1u);
++	unsigned i;
++	for (i = 0; i < 1000 && !(usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & (1u << 31)); i++) {
++		delay(1);
++	}
++	printf("SWEET USB A71: GDSC 0x%08x -> 0x%08x after %u us, CFG 0x%08x, BCR 0x%08x\n",
++	    g, usb_rd(gcc, GCC_USB30_PRIM_GDSCR), i, usb_rd(gcc, GCC_USB30_PRIM_GDSCR + 4),
++	    usb_rd(gcc, GCC_USB30_PRIM_BCR));
++	if (!(usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & (1u << 31))) {
++		return false;
++	}
++
++	/* 3. Master clock 133.33 MHz = GPLL0_OUT_MAIN (src 1) / 4.5 (hid 8), DT core-clk-rate. */
++	uint32_t cmd0 = usb_rd(gcc, GCC_USB30_MASTER_CMD), cfg0 = usb_rd(gcc, GCC_USB30_MASTER_CFG);
++	usb_wr(gcc, GCC_USB30_MASTER_CFG, (cfg0 & ~0x71fu) | (1u << 8) | 8u);
++	usb_wr(gcc, GCC_USB30_MASTER_CMD, usb_rd(gcc, GCC_USB30_MASTER_CMD) | 1u);
++	for (i = 0; i < 500 && (usb_rd(gcc, GCC_USB30_MASTER_CMD) & 1u); i++) {
++		delay(1);
++	}
++	printf("SWEET USB A71: master RCG cmd 0x%08x cfg 0x%08x -> cmd 0x%08x cfg 0x%08x (%s); utmi RCG cmd 0x%08x cfg 0x%08x\n",
++	    cmd0, cfg0, usb_rd(gcc, GCC_USB30_MASTER_CMD), usb_rd(gcc, GCC_USB30_MASTER_CFG),
++	    (usb_rd(gcc, GCC_USB30_MASTER_CMD) & 1u) ? "UPDATE STUCK" : "updated",
++	    usb_rd(gcc, GCC_USB30_UTMI_CMD), usb_rd(gcc, GCC_USB30_UTMI_CFG));
++
++	/* 4. Branch clocks (all of usb_cbcr except ahb2phy/clkref, which ABL leaves on). */
++	bool ok = true;
++	for (unsigned c = 0; c < 5; c++) {
++		ok &= usb_branch_on(gcc, usb_cbcr[c].name, usb_cbcr[c].off);
++	}
++	printf("SWEET USB A71: master RCG after branch enable cmd 0x%08x (bit31 = root off)\n",
++	    usb_rd(gcc, GCC_USB30_MASTER_CMD));
++	return ok;
++}
++
++/* PHY init, UTMI clock as pipe clock, DWC3 in device mode. DWC3 clocks are on. */
++static void
++usb_a71_core_setup(vm_offset_t dwc)
++{
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	vm_offset_t qs = ml_io_map(0x0a6f8800 /* QSCRATCH, defined below */, 0x100);
++	if (phy == 0 || qs == 0) {
++		printf("SWEET USB A71: PHY/QSCRATCH map failed\n");
++		return;
++	}
++	printf("SWEET USB A71: QUSB2 before PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x\n",
++	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240));
++	for (unsigned i = 0; i < sizeof(a71_qusb_init) / sizeof(a71_qusb_init[0]); i++) {
++		usb_wr(phy, a71_qusb_init[i][1], a71_qusb_init[i][0]);
++		delay(1);
++	}
++	delay(200);     /* Linux: 150 us for the PHY PLL to lock */
++	printf("SWEET USB A71: QUSB2 after  PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
++	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
++
++	/* No SuperSpeed PHY: feed the pipe clock from UTMI (Linux dwc3_qcom_select_utmi_clk). */
++	uint32_t gen = usb_rd(qs, 0x08);
++	usb_wr(qs, 0x08, gen | (1u << 8));                      /* PIPE_UTMI_CLK_DIS */
++	delay(100);
++	usb_wr(qs, 0x08, usb_rd(qs, 0x08) | (1u << 0) | (1u << 3)); /* PIPE_UTMI_CLK_SEL, PIPE3_PHYSTATUS_SW */
++	delay(100);
++	usb_wr(qs, 0x08, usb_rd(qs, 0x08) & ~(1u << 8));
++	printf("SWEET USB A71: QSCRATCH GENERAL_CFG 0x%08x -> 0x%08x\n", gen, usb_rd(qs, 0x08));
++
++	/* DWC3: device mode, no clock gating, no USB2 PHY suspend (DT quirks). */
++	uint32_t id = usb_rd(dwc, 0xc120), gctl = usb_rd(dwc, 0xc110), p2 = usb_rd(dwc, 0xc200);
++	usb_wr(dwc, 0xc110, gctl | (1u << 11));                 /* CORESOFTRESET */
++	delay(1000);
++	usb_wr(dwc, 0xc200, p2 & ~((1u << 6) | (1u << 8)));      /* SUSPHY, ENBLSLPM off */
++	usb_wr(dwc, 0xc110, (gctl & ~((3u << 12) | (1u << 11))) | (2u << 12) | 1u);
++	delay(1000);
++	printf("SWEET USB A71: DWC3 id 0x%08x GCTL 0x%08x -> 0x%08x GUSB2PHYCFG 0x%08x -> 0x%08x GSTS 0x%08x\n",
++	    id, gctl, usb_rd(dwc, 0xc110), p2, usb_rd(dwc, 0xc200), usb_rd(dwc, 0xc118));
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -99,6 +236,19 @@ sweet_usb_probe(void)
+ 	}
+ 	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
+ 	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
++	bool powered_here = false;
++	if (!clocks_on && enabled >= 2) {
++		powered_here = usb_a71_power_up(gcc);
++		gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++		for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
++			cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
++		}
++		/* Also the bus (aggre-axi) and utmi clocks: the DWC3 DMAs and needs them. */
++		clocks_on = powered_here && (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) &&
++		    !(cbcr[2] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF) &&
++		    !(cbcr[4] & CBCR_CLK_OFF) && !(cbcr[5] & CBCR_CLK_OFF);
++		printf("SWEET USB A71: power-up %s (GDSC 0x%08x)\n", clocks_on ? "OK" : "FAILED", gdscr);
++	}
+ 	if (!clocks_on) {
+ 		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
+ 		return;
+@@ -108,6 +258,9 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: DWC3 map failed\n");
+ 		return;
+ 	}
++	if (powered_here) {
++		usb_a71_core_setup(dwc);
++	}
+ 	printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
+ 	    usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200));
+ 	printf("SWEET USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
