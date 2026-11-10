@@ -1,0 +1,161 @@
+From: ZorrigAPK <ZorrigAPK@users.noreply.github.com>
+Subject: [PATCH] a71: CPU and L3 frequency via the OSM firmware (sweetcpufreq)
+
+Read the OSM lookup tables of the L3, silver and gold domains, log them
+and the state ABL left, then request the highest non-boost row
+(sweetcpufreq=0 log only, 2 include boost). A fixed loop is timed
+before and after to show the effect.
+
+---
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_cpufreq_init(void);
+
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -660,6 +661,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_cpufreq_init();
+ 	return 0;
+ }
+
+--- /dev/null
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -0,0 +1,121 @@
++/*
++ * SWEET/A71: CPU and L3 frequency through the SM7150 OSM firmware.
++ *
++ * The OSM hardware (DT qcom,cpucc@18321000: osm_l3_base 0x18321000,
++ * osm_pwrcl_base 0x18323000, osm_perfcl_base 0x18325800) exposes, per
++ * domain, a lookup table of up to 40 rows of 32 bytes at 0x110 and a
++ * desired performance-state register at 0x920 (layout of Linux
++ * drivers/cpufreq/qcom-cpufreq-hw.c and drivers/interconnect/qcom/osm-l3.c).
++ * Row: bits 31:30 clock source (0 = 300 MHz GPLL0 path), 18:16 core count
++ * (1 = boost row), 7:0 L-value (x 19.2 MHz). The table ends where a row
++ * repeats the previous frequency. Voltage follows the row in firmware;
++ * the hardware limits (LMh, qcom,limits-dcvs) stay active.
++ *
++ * Boot-arg sweetcpufreq: 0 = log only, 1 (default) = highest non-boost
++ * row, 2 = highest row including boost.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_cpufreq_init(void);
++
++#define OSM_ENABLE      0x000u
++#define OSM_LUT         0x110u
++#define OSM_LUT_ROW     0x20u
++#define OSM_LUT_MAX     40u
++#define OSM_PERF_STATE  0x920u
++
++static const struct {
++	const char *name;
++	vm_offset_t pa;
++} osm_domains[] = {
++	{ "l3", 0x18321000 },
++	{ "silver", 0x18323000 },
++	{ "gold", 0x18325800 },
++};
++
++static uint32_t
++osm_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static unsigned
++osm_khz(uint32_t row)
++{
++	return ((row >> 30) & 3u) ? (row & 0xffu) * 19200u : 300000u;
++}
++
++/* ns for a fixed integer loop on the current CPU (cycle-bound, no memory). */
++static uint64_t
++osm_bench(void)
++{
++	volatile uint64_t acc = 0;
++	uint64_t t0 = mach_absolute_time();
++	for (uint64_t i = 0; i < 20000000ull; i++) {
++		acc += i ^ (acc >> 3);
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns;
++}
++
++void
++sweet_cpufreq_init(void)
++{
++	int policy = 1;
++	(void)PE_parse_boot_argn("sweetcpufreq", &policy, sizeof(policy));
++	uint64_t before = osm_bench();
++
++	for (unsigned d = 0; d < sizeof(osm_domains) / sizeof(osm_domains[0]); d++) {
++		vm_offset_t b = ml_io_map(osm_domains[d].pa, 0x1000);
++		if (!b) {
++			printf("SWEET CPUFREQ: %s map failed\n", osm_domains[d].name);
++			continue;
++		}
++		uint32_t en = osm_rd(b, OSM_ENABLE);
++		uint32_t cur = osm_rd(b, OSM_PERF_STATE);
++		unsigned n = 0, best = 0, best_any = 0, prev = 0;
++		for (unsigned i = 0; i < OSM_LUT_MAX; i++) {
++			uint32_t row = osm_rd(b, OSM_LUT + i * OSM_LUT_ROW);
++			unsigned khz = osm_khz(row), cores = (row >> 16) & 7u;
++			if (i > 0 && khz == prev) {
++				break;
++			}
++			printf("SWEET CPUFREQ: %s[%u] %u MHz cores=%u volt-row %#x\n", osm_domains[d].name, i,
++			    khz / 1000, cores, osm_rd(b, OSM_LUT + 4 + i * OSM_LUT_ROW));
++			if (cores != 1) {
++				best = i;
++			}
++			best_any = i;
++			prev = khz;
++			n++;
++		}
++		printf("SWEET CPUFREQ: %s enable=%#x rows=%u current state=%u (%u MHz) states 0x924..: %#x %#x %#x\n",
++		    osm_domains[d].name, en, n, cur,
++		    cur < n ? osm_khz(osm_rd(b, OSM_LUT + cur * OSM_LUT_ROW)) / 1000 : 0,
++		    osm_rd(b, OSM_PERF_STATE + 4), osm_rd(b, OSM_PERF_STATE + 8), osm_rd(b, OSM_PERF_STATE + 12));
++		if (policy == 0 || !(en & 1u) || n == 0) {
++			continue;
++		}
++		unsigned want = policy >= 2 ? best_any : best;
++		*(volatile uint32_t *)(b + OSM_PERF_STATE) = want;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		delay(2000);
++		uint32_t now = osm_rd(b, OSM_PERF_STATE);
++		printf("SWEET CPUFREQ: %s state %u -> %u (%u MHz), readback %u\n", osm_domains[d].name, cur,
++		    want, osm_khz(osm_rd(b, OSM_LUT + want * OSM_LUT_ROW)) / 1000, now);
++	}
++
++	uint64_t after = osm_bench();
++	printf("SWEET CPUFREQ: bench (boot CPU) before %llu us, after %llu us\n", before / 1000, after / 1000);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
