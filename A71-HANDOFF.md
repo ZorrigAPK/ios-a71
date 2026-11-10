@@ -18,7 +18,7 @@ Talk to them in French, simply; they press buttons and send photos of the screen
 | Volume / power keys (sweet_keys.c, PMIC SPMI reads) | WORK (laggy) |
 | Display | CPU-rendered, ~5 fps, `sweetfb_hz=30`; slow but correct |
 | Touch (Samsung S6SY761/Y771 "sec_ts") | **WORKS** since boot 10 (user confirmed 2026-11-10); accuracy of axes/scale not yet checked — see section 6 |
-| USB device mode | not working (USB30 GDSC/clocks are OFF at boot on the A71, unlike sweet) |
+| USB device mode + network | **WORKS** since boot 12 (2026-11-10, patches 0083 power-up + 0084 CDC-NCM, boot-arg `sweetusb=2`). Windows inbox UsbNcm binds it: adapter "Ethernet 2 / Sweet iOS (USB Ethernet)", PC gets 169.254.x.y/16 by itself, phone ue0 = 169.254.7.2 (`ping 169.254.7.2` OK, 1-2 ms). Live kernel log = UDP broadcast to port 5140, ~45 s after link up: `python -I ios-a71-tools\scripts\usb-log.py ios-a71-tools\logs\bootN-usb.txt 900` (no TWRP needed to read logs any more). boot 11 log = full power-up trace. |
 | Wi-Fi, BT, audio, modem, camera, GPU, real date/time | not working (no drivers) — expected |
 
 Next concrete step: see section 9.
@@ -63,6 +63,9 @@ Tools: adb = `%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe`; gh = `C:\Progr
 python -I tools\mkpayload.py <kernel.development.sweet> ios-a71-tools\a71-build\a71-hi-4.adt payload.bin --cmdline "<CMDLINE>"
 python -I tools\a71-mkboot.py ios-a71-tools\backup\boot.img ios-a71-tools\shim-build\Image out-boot.img payload.bin
 ```
+Since boot 11 append ` sweetusb=2` to this CMDLINE (build-flash.ps1 `-Extra 'sweetusb=2'`).
+Full loop in one command: `ios-a71-tools\scripts\build-flash.ps1 -RunId <CI run id> -N <n> -Extra 'sweetusb=2'`
+(waits for CI, then for TWRP, builds, flashes, verifies sha256, reboots).
 CMDLINE in use (boot 4..7):
 `debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetsample=SpringBoard,lsd,installd`
 - `sweetfb_noconsole=1` hides the kernel console only once the GUI presents its first frame. If the
