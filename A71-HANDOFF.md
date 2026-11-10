@@ -17,7 +17,7 @@ Talk to them in French, simply; they press buttons and send photos of the screen
 | iOS 16.7.16 (iPhone X userland) boots to the **lock screen** | WORKS (since boot.img 4) |
 | Volume / power keys (sweet_keys.c, PMIC SPMI reads) | WORK (laggy) |
 | Display | CPU-rendered, ~5 fps, `sweetfb_hz=30`; slow but correct |
-| Touch (Samsung S6SY761/Y771 "sec_ts") | **IN PROGRESS** — see section 6 |
+| Touch (Samsung S6SY761/Y771 "sec_ts") | **WORKS** since boot 10 (user confirmed 2026-11-10); accuracy of axes/scale not yet checked — see section 6 |
 | USB device mode | not working (USB30 GDSC/clocks are OFF at boot on the A71, unlike sweet) |
 | Wi-Fi, BT, audio, modem, camera, GPU, real date/time | not working (no drivers) — expected |
 
