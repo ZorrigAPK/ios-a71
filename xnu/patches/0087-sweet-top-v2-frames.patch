@@ -1,0 +1,228 @@
+From: ZorrigAPK <ZorrigAPK@users.noreply.github.com>
+Subject: [PATCH] sweet: top v2 - user/kernel split, backtraces, frame rate
+
+Split each process and thread's CPU share into user and kernel time,
+print a short user backtrace of the hottest threads, and add to each
+pass the number of swaps CoreAnimation sent, the number of frames the
+vsync timer copied to the panel and the average copy time.
+
+---
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index d4aa032..ddbf268 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -90,6 +90,7 @@ extern uint64_t sweet_top_task(const char *name, int pid, task_t task, uint32_t
+     uint64_t interval, uint32_t min_permille);      /* osfmk/kern/exception.c */
+ 
+ extern uint64_t sweet_top_idle;
++extern uint64_t sweet_fb_swap_count, sweet_fb_present_count, sweet_fb_present_mach; /* SweetFramebuffer.cpp */
+ static uint32_t sweet_top_gen, sweet_top_min;
+ static uint64_t sweet_top_interval, sweet_top_sum;
+ 
+@@ -117,6 +118,7 @@ sweet_top_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ 	(void)tsleep(&chan, PZERO, "sweettop", 60 * hz);
+ 	uint64_t last = mach_absolute_time();
++	uint64_t swaps0 = sweet_fb_swap_count, pres0 = sweet_fb_present_count, pmach0 = sweet_fb_present_mach;
+ 	for (int i = 0; i < 360; i++) {
+ 		uint64_t now = mach_absolute_time();
+ 		sweet_top_gen++;
+@@ -125,6 +127,9 @@ sweet_top_thread(__unused void *arg, __unused wait_result_t wr)
+ 		sweet_top_sum = 0;
+ 		sweet_top_idle = 0;
+ 		last = now;
++		swaps0 = sweet_fb_swap_count;
++		pres0 = sweet_fb_present_count;
++		pmach0 = sweet_fb_present_mach;
+ 		if (i > 0) {
+ 			printf("TOP --- pass %d\n", i);
+ 		}
+@@ -132,9 +137,15 @@ sweet_top_thread(__unused void *arg, __unused wait_result_t wr)
+ 		if (i > 0 && sweet_top_interval) {
+ 			uint64_t ns;
+ 			absolutetime_to_nanoseconds(sweet_top_interval, &ns);
+-			printf("TOP === busy %llu%% idle %llu%% (100%% = one CPU, 8 CPUs) in %llu ms\n",
++			uint64_t sw = sweet_fb_swap_count - swaps0, pr = sweet_fb_present_count - pres0;
++			uint64_t pns;
++			absolutetime_to_nanoseconds(sweet_fb_present_mach - pmach0, &pns);
++			printf("TOP === busy %llu%% idle %llu%% (100%% = one CPU, 8 CPUs) in %llu ms; "
++			    "frames: %llu swaps (%llu.%llu/s), %llu presents, %llu us per present\n",
+ 			    sweet_top_sum * 100 / sweet_top_interval,
+-			    sweet_top_idle * 100 / sweet_top_interval, ns / 1000000);
++			    sweet_top_idle * 100 / sweet_top_interval, ns / 1000000,
++			    sw, sw * 1000000000ull / (ns ? ns : 1), (sw * 10000000000ull / (ns ? ns : 1)) % 10,
++			    pr, pr ? pns / 1000 / pr : 0);
+ 		}
+ 		(void)tsleep(&chan, PZERO, "sweettop", secs * hz);
+ 	}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..acee5b9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -253,7 +253,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		uint64_t t0 = mach_absolute_time();
+ 		fb->present(rec);
++		sweet_fb_present_mach += mach_absolute_time() - t0;
++		sweet_fb_present_count++;
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -287,7 +290,9 @@ get32(const uint8_t *p, uint32_t off)
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
+-static uint64_t sweet_fb_swap_count;
++/* Frame counters, read by the top profiler (bsd/dev/sweet_sample.c). */
++extern "C" uint64_t sweet_fb_swap_count, sweet_fb_present_count, sweet_fb_present_mach;
++uint64_t sweet_fb_swap_count, sweet_fb_present_count, sweet_fb_present_mach;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 659d34a..3858b39 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1044,20 +1044,22 @@ sweet_sample_task(const char *name, int pid, task_t task)
+  * SWEET "top": CPU time each thread used since the previous pass, to see
+  * what keeps the CPUs busy (software rendering, polling, ...). Called for
+  * every process each interval from bsd/dev/sweet_sample.c. Prints the
+- * process share of one CPU and its three hottest threads with their last
+- * user pc/lr (a preempted thread's saved state is where it was running).
++ * process share of one CPU (user / kernel) and its three hottest threads
++ * with their last user pc and a short frame-pointer backtrace (a thread
++ * that is not running shows where it last entered the kernel).
+  */
+ #include <kern/recount.h>
+ #include <kern/clock.h>
+ #include <mach/thread_info.h>   /* MAXTHREADNAMESIZE */
+ 
+ #define SWEET_TOP_SLOTS 8192u
++#define SWEET_TOP_BT    6
+ static struct {
+ 	uint64_t tid;
+-	uint64_t mach;
++	uint64_t user, sys;
+ 	uint32_t gen;
+ } sweet_top_tab[SWEET_TOP_SLOTS];
+-uint64_t sweet_top_idle;            /* idle-thread time, summed over passes by the caller */
++uint64_t sweet_top_idle;            /* idle-thread time, reset by the caller each pass */
+ 
+ uint64_t sweet_top_task(const char *name, int pid, task_t task, uint32_t gen,
+     uint64_t interval, uint32_t min_permille);
+@@ -1067,18 +1069,20 @@ sweet_top_task(const char *name, int pid, task_t task, uint32_t gen,
+     uint64_t interval, uint32_t min_permille)
+ {
+ 	struct {
+-		uint64_t d, tid, pc, lr;
++		uint64_t d, du, ds, tid, pc;
++		uint64_t bt[SWEET_TOP_BT];
+ 		char nm[MAXTHREADNAMESIZE];
+ 	} hot[3];
+-	uint64_t total = 0;
++	uint64_t total = 0, total_sys = 0;
+ 	unsigned nthreads = 0;
+ 	thread_t thread;
++	vm_map_t map = get_task_map(task);
+ 
+ 	bzero(hot, sizeof(hot));
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+ 		uint64_t tid = thread_tid(thread);
+-		uint64_t t = recount_thread_time_mach(thread);
++		struct recount_times_mach tm = recount_thread_times(thread);
+ 		bool idle = (thread->state & TH_IDLE) != 0;
+ 		uint32_t h = (uint32_t)((tid * 0x9E3779B97F4A7C15ull) >> 40) & (SWEET_TOP_SLOTS - 1);
+ 		int found = -1, spot = -1;
+@@ -1098,35 +1102,60 @@ sweet_top_task(const char *name, int pid, task_t task, uint32_t gen,
+ 				spot = (int)h;      /* stale: thread gone */
+ 			}
+ 		}
+-		uint64_t d = 0;
++		uint64_t du, ds;
+ 		if (found >= 0) {
+-			d = t >= sweet_top_tab[found].mach ? t - sweet_top_tab[found].mach : 0;
++			du = tm.rtm_user >= sweet_top_tab[found].user ? tm.rtm_user - sweet_top_tab[found].user : 0;
++			ds = tm.rtm_system >= sweet_top_tab[found].sys ? tm.rtm_system - sweet_top_tab[found].sys : 0;
+ 		} else {
+-			d = t;                      /* new thread: all its time is recent */
++			du = tm.rtm_user;           /* new thread: all its time is recent */
++			ds = tm.rtm_system;
+ 			found = spot;
+ 			if (found >= 0) {
+ 				sweet_top_tab[found].tid = tid;
+ 			}
+ 		}
+ 		if (found >= 0) {
+-			sweet_top_tab[found].mach = t;
++			sweet_top_tab[found].user = tm.rtm_user;
++			sweet_top_tab[found].sys = tm.rtm_system;
+ 			sweet_top_tab[found].gen = gen;
+ 		}
++		uint64_t d = du + ds;
+ 		if (idle) {
+ 			sweet_top_idle += d;
+ 			continue;
+ 		}
+ 		total += d;
++		total_sys += ds;
++		if (interval == 0) {
++			continue;               /* recording pass */
++		}
+ 		for (int k = 0; k < 3; k++) {
+ 			if (d > hot[k].d) {
+ 				for (int m = 2; m > k; m--) {
+ 					hot[m] = hot[m - 1];
+ 				}
++				bzero(&hot[k], sizeof(hot[k]));
+ 				hot[k].d = d;
++				hot[k].du = du;
++				hot[k].ds = ds;
+ 				hot[k].tid = tid;
+ 				arm_saved_state_t *ss = find_user_regs(thread);
+-				hot[k].pc = (ss && is_saved_state64(ss)) ? get_saved_state_pc(ss) : 0;
+-				hot[k].lr = (ss && is_saved_state64(ss)) ? get_saved_state_lr(ss) : 0;
++				if (ss && is_saved_state64(ss)) {
++					uint64_t fp = get_saved_state_fp(ss);
++					hot[k].pc = get_saved_state_pc(ss);
++					hot[k].bt[0] = get_saved_state_lr(ss);
++					for (int f = 1; f < SWEET_TOP_BT && fp != 0 && (fp & 7) == 0; f++) {
++						uint64_t frame[2];
++						if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
++							break;
++						}
++						hot[k].bt[f] = frame[1];
++						if (frame[0] <= fp) {
++							break;
++						}
++						fp = frame[0];
++					}
++				}
+ 				thread_get_thread_name(thread, hot[k].nm);
+ 				break;
+ 			}
+@@ -1137,16 +1166,16 @@ sweet_top_task(const char *name, int pid, task_t task, uint32_t gen,
+ 	if (interval == 0 || total * 1000 < interval * (uint64_t)min_permille) {
+ 		return total;
+ 	}
+-	uint64_t ms;
+-	absolutetime_to_nanoseconds(total, &ms);
+-	printf("TOP %s[%d] %llu.%llu%% (%llu ms, %u threads)\n", name, pid,
+-	    total * 100 / interval, (total * 1000 / interval) % 10, ms / 1000000, nthreads);
++	printf("TOP %s[%d] %llu%% user %llu%% sys %llu%% (%u threads)\n", name, pid,
++	    total * 100 / interval, (total - total_sys) * 100 / interval, total_sys * 100 / interval, nthreads);
+ 	for (int k = 0; k < 3; k++) {
+ 		if (hot[k].d * 100 < interval) {        /* under 1 % */
+ 			break;
+ 		}
+-		printf("TOP   %s t%llu '%s' %llu%% pc 0x%llx lr 0x%llx\n", name, hot[k].tid, hot[k].nm,
+-		    hot[k].d * 100 / interval, hot[k].pc, hot[k].lr);
++		printf("TOP   %s t%llu '%s' %llu%% u%llu s%llu pc 0x%llx bt 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx\n",
++		    name, hot[k].tid, hot[k].nm, hot[k].d * 100 / interval, hot[k].du * 100 / interval,
++		    hot[k].ds * 100 / interval, hot[k].pc, hot[k].bt[0], hot[k].bt[1], hot[k].bt[2],
++		    hot[k].bt[3], hot[k].bt[4], hot[k].bt[5]);
+ 	}
+ 	return total;
+ }
