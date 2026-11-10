@@ -1,0 +1,221 @@
+From: ZorrigAPK <ZorrigAPK@users.noreply.github.com>
+Subject: [PATCH] sweet: "top" profiler - CPU share per process and hottest threads
+
+Every sweettop seconds (default 5, 0 = off), print for each process
+using at least 2 % of one CPU its share and its three hottest threads
+(name, user pc/lr), plus the total busy and idle time. Per-thread CPU
+time comes from recount_thread_time_mach(); previous values are kept in
+a small table keyed by thread id. Meant to find what limits the
+software-rendered UI.
+
+---
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index b40eccd..d4aa032 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -19,6 +19,8 @@
+ #include <kern/task.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
+ 
+ extern task_t proc_task(proc_t);
+ extern int hz;
+@@ -78,6 +80,66 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++/*
++ * SWEET top (boot-arg sweettop=<seconds>, default 5, 0 = off): every interval,
++ * the CPU share of each process using at least 2 % of one CPU (100 % = one
++ * core busy, 8 cores = 800 %), with its hottest threads. 60 s after start,
++ * 360 passes at most.
++ */
++extern uint64_t sweet_top_task(const char *name, int pid, task_t task, uint32_t gen,
++    uint64_t interval, uint32_t min_permille);      /* osfmk/kern/exception.c */
++
++extern uint64_t sweet_top_idle;
++static uint32_t sweet_top_gen, sweet_top_min;
++static uint64_t sweet_top_interval, sweet_top_sum;
++
++static int
++sweet_top_proc(proc_t p, __unused void *arg)
++{
++	char name[32];
++	task_t task = proc_task(p);
++	if (task != TASK_NULL) {
++		proc_name(proc_pid(p), name, sizeof(name));
++		sweet_top_sum += sweet_top_task(name, proc_pid(p), task, sweet_top_gen,
++		    sweet_top_interval, sweet_top_min);
++	}
++	return PROC_RETURNED;
++}
++
++static void
++sweet_top_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	int secs = 5;
++	(void)PE_parse_boot_argn("sweettop", &secs, sizeof(secs));
++	if (secs <= 0) {
++		return;
++	}
++	(void)tsleep(&chan, PZERO, "sweettop", 60 * hz);
++	uint64_t last = mach_absolute_time();
++	for (int i = 0; i < 360; i++) {
++		uint64_t now = mach_absolute_time();
++		sweet_top_gen++;
++		sweet_top_interval = i == 0 ? 0 : now - last;   /* first pass only records */
++		sweet_top_min = 20;
++		sweet_top_sum = 0;
++		sweet_top_idle = 0;
++		last = now;
++		if (i > 0) {
++			printf("TOP --- pass %d\n", i);
++		}
++		proc_iterate(PROC_ALLPROCLIST, sweet_top_proc, NULL, NULL, NULL);
++		if (i > 0 && sweet_top_interval) {
++			uint64_t ns;
++			absolutetime_to_nanoseconds(sweet_top_interval, &ns);
++			printf("TOP === busy %llu%% idle %llu%% (100%% = one CPU, 8 CPUs) in %llu ms\n",
++			    sweet_top_sum * 100 / sweet_top_interval,
++			    sweet_top_idle * 100 / sweet_top_interval, ns / 1000000);
++		}
++		(void)tsleep(&chan, PZERO, "sweettop", secs * hz);
++	}
++}
++
+ void
+ sweet_sample_start(void)
+ {
+@@ -85,4 +147,7 @@ sweet_sample_start(void)
+ 	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (kernel_thread_start(sweet_top_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..659d34a 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1040,6 +1040,117 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 	task_unlock(task);
+ }
+ 
++/*
++ * SWEET "top": CPU time each thread used since the previous pass, to see
++ * what keeps the CPUs busy (software rendering, polling, ...). Called for
++ * every process each interval from bsd/dev/sweet_sample.c. Prints the
++ * process share of one CPU and its three hottest threads with their last
++ * user pc/lr (a preempted thread's saved state is where it was running).
++ */
++#include <kern/recount.h>
++#include <kern/clock.h>
++#include <mach/thread_info.h>   /* MAXTHREADNAMESIZE */
++
++#define SWEET_TOP_SLOTS 8192u
++static struct {
++	uint64_t tid;
++	uint64_t mach;
++	uint32_t gen;
++} sweet_top_tab[SWEET_TOP_SLOTS];
++uint64_t sweet_top_idle;            /* idle-thread time, summed over passes by the caller */
++
++uint64_t sweet_top_task(const char *name, int pid, task_t task, uint32_t gen,
++    uint64_t interval, uint32_t min_permille);
++
++uint64_t
++sweet_top_task(const char *name, int pid, task_t task, uint32_t gen,
++    uint64_t interval, uint32_t min_permille)
++{
++	struct {
++		uint64_t d, tid, pc, lr;
++		char nm[MAXTHREADNAMESIZE];
++	} hot[3];
++	uint64_t total = 0;
++	unsigned nthreads = 0;
++	thread_t thread;
++
++	bzero(hot, sizeof(hot));
++	task_lock(task);
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		uint64_t tid = thread_tid(thread);
++		uint64_t t = recount_thread_time_mach(thread);
++		bool idle = (thread->state & TH_IDLE) != 0;
++		uint32_t h = (uint32_t)((tid * 0x9E3779B97F4A7C15ull) >> 40) & (SWEET_TOP_SLOTS - 1);
++		int found = -1, spot = -1;
++		nthreads++;
++		for (unsigned k = 0; k < 128; k++, h = (h + 1) & (SWEET_TOP_SLOTS - 1)) {
++			if (sweet_top_tab[h].tid == tid) {
++				found = (int)h;
++				break;
++			}
++			if (sweet_top_tab[h].tid == 0) {
++				if (spot < 0) {
++					spot = (int)h;
++				}
++				break;
++			}
++			if (spot < 0 && sweet_top_tab[h].gen + 3 < gen) {
++				spot = (int)h;      /* stale: thread gone */
++			}
++		}
++		uint64_t d = 0;
++		if (found >= 0) {
++			d = t >= sweet_top_tab[found].mach ? t - sweet_top_tab[found].mach : 0;
++		} else {
++			d = t;                      /* new thread: all its time is recent */
++			found = spot;
++			if (found >= 0) {
++				sweet_top_tab[found].tid = tid;
++			}
++		}
++		if (found >= 0) {
++			sweet_top_tab[found].mach = t;
++			sweet_top_tab[found].gen = gen;
++		}
++		if (idle) {
++			sweet_top_idle += d;
++			continue;
++		}
++		total += d;
++		for (int k = 0; k < 3; k++) {
++			if (d > hot[k].d) {
++				for (int m = 2; m > k; m--) {
++					hot[m] = hot[m - 1];
++				}
++				hot[k].d = d;
++				hot[k].tid = tid;
++				arm_saved_state_t *ss = find_user_regs(thread);
++				hot[k].pc = (ss && is_saved_state64(ss)) ? get_saved_state_pc(ss) : 0;
++				hot[k].lr = (ss && is_saved_state64(ss)) ? get_saved_state_lr(ss) : 0;
++				thread_get_thread_name(thread, hot[k].nm);
++				break;
++			}
++		}
++	}
++	task_unlock(task);
++
++	if (interval == 0 || total * 1000 < interval * (uint64_t)min_permille) {
++		return total;
++	}
++	uint64_t ms;
++	absolutetime_to_nanoseconds(total, &ms);
++	printf("TOP %s[%d] %llu.%llu%% (%llu ms, %u threads)\n", name, pid,
++	    total * 100 / interval, (total * 1000 / interval) % 10, ms / 1000000, nthreads);
++	for (int k = 0; k < 3; k++) {
++		if (hot[k].d * 100 < interval) {        /* under 1 % */
++			break;
++		}
++		printf("TOP   %s t%llu '%s' %llu%% pc 0x%llx lr 0x%llx\n", name, hot[k].tid, hot[k].nm,
++		    hot[k].d * 100 / interval, hot[k].pc, hot[k].lr);
++	}
++	return total;
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ kern_return_t
